@@ -2,7 +2,7 @@
 """Installer for code-router runtime assets.
 
 Installs:
-- code-router binary (copied from prebuilt artifacts in ./dist)
+- code-router binary (downloaded from GitHub Release assets)
 - per-backend prompt placeholders under ~/.code-router/prompts
 - ~/.code-router/.env template for runtime configuration
 
@@ -15,15 +15,20 @@ Targets:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import platform
 import shutil
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 
-REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_INSTALL_DIR = "~/.code-router"
+DEFAULT_RELEASE_REPO = "zhu-jl18/code-router"
+DEFAULT_RELEASE_TAG = "latest"
+HTTP_TIMEOUT_SEC = 30
 
 BACKENDS = ("codex", "claude", "gemini")
 
@@ -46,18 +51,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Skip installing code-router binary (only install runtime config/assets)",
     )
+    p.add_argument(
+        "--repo",
+        default=DEFAULT_RELEASE_REPO,
+        help=f"GitHub repo for release assets (default: {DEFAULT_RELEASE_REPO})",
+    )
+    p.add_argument(
+        "--release-tag",
+        default=DEFAULT_RELEASE_TAG,
+        help=f"Release tag to install (default: {DEFAULT_RELEASE_TAG})",
+    )
     return p.parse_args(argv)
 
 
 def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
-
-
-def _copy_file(src: Path, dst: Path, *, force: bool) -> None:
-    _ensure_dir(dst.parent)
-    if dst.exists() and not force:
-        return
-    shutil.copy2(src, dst)
 
 
 def _write_if_missing(path: Path, content: str, *, force: bool) -> None:
@@ -94,31 +102,109 @@ def _install_env_template(install_dir: Path, *, force: bool) -> None:
 
 
 def _get_artifact_name() -> str:
-    """Get the correct artifact name for the current platform."""
+    """Return release asset name for the current OS/arch."""
     system = platform.system()
-    if system == "Windows":
+    machine = platform.machine().lower()
+
+    if system == "Windows" and machine in ("amd64", "x86_64"):
         return "code-router-windows-amd64.exe"
-    elif system == "Darwin":
+    if system == "Darwin" and machine in ("arm64", "aarch64"):
         return "code-router-darwin-arm64"
-    else:
+    if system == "Linux" and machine in ("amd64", "x86_64"):
         return "code-router-linux-amd64"
 
+    raise RuntimeError(f"unsupported platform for release asset: {system}/{machine}")
 
-def _copy_prebuilt_wrapper(install_dir: Path, *, force: bool) -> Path:
+
+def _github_headers() -> dict[str, str]:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "code-router-installer",
+    }
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _load_release_metadata(repo: str, tag: str) -> dict:
+    api_url = f"https://api.github.com/repos/{repo}/releases/tags/{tag}"
+    req = urllib.request.Request(api_url, headers=_github_headers())
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as resp:
+            payload = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise FileNotFoundError(f"release tag not found: {repo}@{tag}") from e
+        if e.code == 403:
+            raise RuntimeError("GitHub API access denied or rate-limited; set GITHUB_TOKEN and retry") from e
+        raise RuntimeError(f"failed to fetch release metadata ({e.code})") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"network error while fetching release metadata: {e.reason}") from e
+
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError as e:
+        raise RuntimeError("invalid release metadata response from GitHub API") from e
+
+    if not isinstance(data, dict):
+        raise RuntimeError("unexpected release metadata structure from GitHub API")
+    return data
+
+
+def _resolve_asset_download_url(release: dict, asset_name: str) -> str:
+    assets = release.get("assets")
+    if not isinstance(assets, list):
+        raise RuntimeError("release metadata missing assets list")
+
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        if asset.get("name") == asset_name:
+            url = asset.get("browser_download_url", "")
+            if isinstance(url, str) and url:
+                return url
+            break
+
+    available = sorted(
+        str(asset.get("name"))
+        for asset in assets
+        if isinstance(asset, dict) and isinstance(asset.get("name"), str)
+    )
+    listed = ", ".join(available) if available else "<none>"
+    raise FileNotFoundError(f"release asset not found: {asset_name} (available: {listed})")
+
+
+def _download_to_path(url: str, out: Path) -> None:
+    _ensure_dir(out.parent)
+    tmp = out.with_suffix(out.suffix + ".tmp")
+    req = urllib.request.Request(url, headers={"User-Agent": "code-router-installer"})
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as resp:
+            with tmp.open("wb") as f:
+                shutil.copyfileobj(resp, f)
+        os.replace(tmp, out)
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"network error while downloading binary: {e.reason}") from e
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+
+
+def _install_wrapper_from_release(install_dir: Path, *, repo: str, tag: str, force: bool) -> Path:
     bin_dir = install_dir / "bin"
     _ensure_dir(bin_dir)
     exe_name = "code-router.exe" if os.name == "nt" else "code-router"
     out = bin_dir / exe_name
 
-    artifact_name = _get_artifact_name()
-    artifact = REPO_ROOT / "dist" / artifact_name
-    if not artifact.exists():
-        raise FileNotFoundError(f"missing prebuilt artifact: {artifact}")
-
     if out.exists() and not force:
         return out
 
-    shutil.copy2(artifact, out)
+    asset_name = _get_artifact_name()
+    release = _load_release_metadata(repo, tag)
+    download_url = _resolve_asset_download_url(release, asset_name)
+    _download_to_path(download_url, out)
+
     if os.name != "nt":
         try:
             out.chmod(0o755)
@@ -189,17 +275,22 @@ def main(argv: list[str] | None = None) -> int:
     wrapper_path: Path | None = None
     if not args.skip_wrapper:
         try:
-            wrapper_path = _copy_prebuilt_wrapper(install_dir, force=args.force)
-        except FileNotFoundError as e:
+            wrapper_path = _install_wrapper_from_release(
+                install_dir,
+                repo=args.repo,
+                tag=args.release_tag,
+                force=args.force,
+            )
+        except (FileNotFoundError, RuntimeError) as e:
             print(f"ERROR: {e}", file=sys.stderr)
-            print("Hint: run `bash scripts/build-dist.sh` in the repo root to generate ./dist artifacts.", file=sys.stderr)
+            print("Hint: verify network access and release assets, or use --skip-wrapper to install config only.", file=sys.stderr)
             return 1
 
     print(f"Installed to: {install_dir}")
     print(f"- env:      {install_dir / '.env'}")
     print(f"- prompts:  {install_dir / 'prompts'} (*-prompt.md placeholders)")
     if wrapper_path is not None:
-        print(f"- wrapper:  {wrapper_path} (copied from ./dist)")
+        print(f"- wrapper:  {wrapper_path} (downloaded from GitHub release {args.repo}@{args.release_tag})")
 
     print("")
     print("Manual setup required:")

@@ -24,7 +24,7 @@
 
 ## 安装（WSL2/Linux + macOS + Windows）
 
-最推荐的安装方式：直接复制 `./dist` 的编译产物（安装时不需要 Go）。
+默认安装方式：从 GitHub Release 的 `latest` 标签下载当前平台二进制（安装时不需要 Go）。
 
 ```bash
 python3 install.py
@@ -34,6 +34,7 @@ python3 install.py
 ```bash
 python3 install.py --install-dir ~/.code-router --force
 python3 install.py --skip-wrapper
+python3 install.py --repo zhu-jl18/code-router --release-tag latest
 ```
 
 安装器会做这些事：
@@ -49,14 +50,15 @@ python3 install.py --skip-wrapper
 
 提示：
 - 在 WSL 里运行 `install.py` 会安装 Linux wrapper；在 macOS（Apple Silicon）里运行会安装 Darwin arm64 wrapper；在 Windows 里运行会安装 Windows `.exe`。
+- 需要网络访问 GitHub Release；如只想更新配置文件，使用 `--skip-wrapper`。
 
-## 维护（重新编译 dist 二进制）
+## 本地构建（可选）
 
 ```bash
 bash scripts/build-dist.sh
 ```
 
-产物：
+本地构建产物（默认不提交到 git）：
 - `dist/code-router-linux-amd64`
 - `dist/code-router-darwin-arm64`
 - `dist/code-router-windows-amd64.exe`

@@ -23,6 +23,8 @@ What you get:
 
 ## Install (WSL2/Linux + macOS + Windows)
 
+Default install path: download the current-platform binary from GitHub Release tag `latest` (no Go required).
+
 ```bash
 python3 install.py
 ```
@@ -31,6 +33,7 @@ Optional:
 ```bash
 python3 install.py --install-dir ~/.code-router --force
 python3 install.py --skip-wrapper
+python3 install.py --repo zhu-jl18/code-router --release-tag latest
 ```
 
 Installer outputs:
@@ -44,13 +47,17 @@ Not automated (manual by design):
   - **Skills**: pick from `skills/*` (for example: `skills/dev`, `skills/code-router`, `skills/code-council`)
   - **/dev command (Claude Code, etc.)**: use `dev-workflow/commands/dev.md` and `dev-workflow/agents/*`
 
-## Maintain (Rebuild Dist Binaries)
+Notes:
+- `install.py` requires network access to GitHub Releases for wrapper installation.
+- Use `--skip-wrapper` if you only need runtime config/assets.
+
+## Local Build (Optional)
 
 ```bash
 bash scripts/build-dist.sh
 ```
 
-This produces:
+Local artifacts (not tracked by git by default):
 - `dist/code-router-linux-amd64`
 - `dist/code-router-darwin-arm64`
 - `dist/code-router-windows-amd64.exe`
