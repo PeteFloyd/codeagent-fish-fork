@@ -1,6 +1,6 @@
 ---
 name: code-council
-description: Multi-backend parallel code review using code-router. Runs 2-3 AI reviewers simultaneously with the same comprehensive review prompt, then the host agent verifies findings and synthesizes a final report.
+description: Multi-backend parallel code review using code-router. Runs 2-3 AI reviewers simultaneously, then the host agent verifies findings and synthesizes a final report.
 compatibility: Requires code-router skill with at least 2 backends configured (codex, claude, gemini).
 ---
 
@@ -29,28 +29,47 @@ Resolve target files from user input:
 
 If scope is ambiguous, ask the user to clarify.
 
-### Step 2: Select Backends
+`@` references are resolved by code-router at execution time — the host agent passes them through as-is, no pre-processing needed.
 
-Ask the user which backends to enable for parallel review:
+### Step 2: Determine Backends
 
-**Options**:
-- codex (recommended)
-- claude (recommended)
-- gemini (recommended)
+**Do NOT ask the user** unless the invocation is genuinely ambiguous.
 
-**Multi-select**: Allow user to pick one or more backends
-
-**Default**: All three enabled
-
-**Fallback** (if AskUserQuestion is not available in your environment):
-- Stop and ask the user explicitly: "Which backends do you want to use for review? Options: codex, claude, gemini. Default: all three."
-- Wait for user response before proceeding
+Resolution order:
+1. User explicitly specified backends in the invocation → use those
+2. Neither specified → default to **all three** (codex, claude, gemini)
 
 ### Step 3: Build & Execute Parallel Review
 
-Construct a single `code-router --parallel` invocation. All backends run the **same comprehensive review prompt**.
+Construct a single `code-router --parallel` invocation. All backends receive the **same review prompt**.
 
-**Template (3 backends)**:
+#### Review Prompt (single source of truth)
+
+```text
+You are a code reviewer. Perform a comprehensive review of the target code.
+
+Focus on:
+1. Security vulnerabilities (injection, auth bypass, data exposure)
+2. Logic errors and bugs
+3. Performance issues
+4. Error handling completeness
+5. Code quality and maintainability
+6. Potential edge cases
+
+Target: [@ file references or inline diff]
+
+Output format:
+## Code Review Findings
+For each finding:
+- **[CRITICAL|WARNING|INFO]**: one-line summary
+  - Location: file:line
+  - Detail: what is wrong and why it matters
+  - Suggestion: concrete fix
+```
+
+#### Command Template
+
+Generate one `---TASK---` block per selected backend. Each block uses `id: review_<backend>`, sets `backend: <backend>`, and pastes the review prompt above into `---CONTENT---`.
 
 ```bash
 code-router --parallel --backend codex <<'EOF'
@@ -58,105 +77,44 @@ code-router --parallel --backend codex <<'EOF'
 id: review_codex
 backend: codex
 ---CONTENT---
-You are a code reviewer. Perform a comprehensive review of the target code.
-
-Focus on:
-1. Security vulnerabilities (injection, auth bypass, data exposure)
-2. Logic errors and bugs
-3. Performance issues
-4. Error handling completeness
-5. Code quality and maintainability
-6. Potential edge cases
-
-Target: [@ file references]
-
-Output format:
-## Code Review Findings
-For each finding:
-- **[CRITICAL|WARNING|INFO]**: one-line summary
-  - Location: file:line
-  - Detail: what is wrong and why it matters
-  - Suggestion: concrete fix
+<review prompt with target filled in>
 
 ---TASK---
 id: review_claude
 backend: claude
 ---CONTENT---
-You are a code reviewer. Perform a comprehensive review of the target code.
-
-Focus on:
-1. Security vulnerabilities (injection, auth bypass, data exposure)
-2. Logic errors and bugs
-3. Performance issues
-4. Error handling completeness
-5. Code quality and maintainability
-6. Potential edge cases
-
-Target: [@ file references]
-
-Output format:
-## Code Review Findings
-For each finding:
-- **[CRITICAL|WARNING|INFO]**: one-line summary
-  - Location: file:line
-  - Detail: what is wrong and why it matters
-  - Suggestion: concrete fix
-
----TASK---
-id: review_gemini
-backend: gemini
----CONTENT---
-You are a code reviewer. Perform a comprehensive review of the target code.
-
-Focus on:
-1. Security vulnerabilities (injection, auth bypass, data exposure)
-2. Logic errors and bugs
-3. Performance issues
-4. Error handling completeness
-5. Code quality and maintainability
-6. Potential edge cases
-
-Target: [@ file references]
-
-Output format:
-## Code Review Findings
-For each finding:
-- **[CRITICAL|WARNING|INFO]**: one-line summary
-  - Location: file:line
-  - Detail: what is wrong and why it matters
-  - Suggestion: concrete fix
+<review prompt with target filled in>
 EOF
 ```
 
-**Template (2 backends)**: Omit one `---TASK---` block
-
-**Template (1 backend)**: Use single `---TASK---` block
+For 3 backends, add a third `---TASK---` block for gemini. For 1 backend, use a single block.
 
 ### Step 4: Host Agent Verification & Synthesis (MANDATORY — DO NOT SKIP)
 
 After code-router returns, the host agent MUST verify findings and synthesize the final report.
 
-Note: each code-router task is a full AI agent with complete filesystem access — it can read any file, run git commands, and explore the entire project. Tasks are NOT "blind" to the project. What they lack is the **user's conversation context** — the host agent knows what the user has been discussing, their priorities, and their intent.
+Each code-router task is a full AI agent with complete filesystem access — it can read any file, run git commands, and explore the entire project. What they lack is the **user's conversation context** — the host agent knows what the user has been discussing, their priorities, and their intent.
 
-**Why this step exists**:
-- **User context**: The host agent carries the ongoing conversation — it knows what the user cares about, prior discussions, and implicit priorities
-- **Verification**: Backends may produce false positives or miss real issues — the host agent must verify each finding
-- **Interactive ability**: The host agent can ask the user follow-up questions; code-router tasks are fire-and-forget
-- **Quality gate**: Raw outputs should be verified and synthesized, not dumped as-is
-
-**What the host agent does**:
+#### Verification Rules
 
 1. **Read all review outputs** from each backend
-2. **Deduplicate**: merge findings that point to the same issue, note which backends agree
-3. **Verify each finding**:
-   - Re-examine the code to confirm the issue is real
-   - If a finding is false positive, mark it and explain why
-   - If backends missed something, add your own findings
-4. **Rank by severity**: CRITICAL first, then WARNING, then INFO
-5. **Group by file**
-6. **Output final report** titled "## Code Council — Verified Review"
-   - Include a summary: total counts by severity
-   - Note which backends reported each finding
+2. **Deduplicate**: merge findings that point to the same issue
+3. **Confidence scoring via agreement**:
+   - Finding reported by ≥2 backends → **high confidence**, include by default
+   - Finding reported by only 1 backend → **needs verification** (see below)
+4. **Verify single-source findings**:
+   - Read the actual code at the reported location
+   - Quote the specific line(s) that confirm or refute the finding
+   - If you cannot point to concrete code evidence, mark as **unconfirmed** and include with a caveat
+5. **CRITICAL findings require trace**:
+   - For any CRITICAL finding, trace the execution path or data flow that leads to the issue
+   - If the trace does not hold, downgrade to WARNING or discard
+6. **Add missed findings**: if the host agent spots issues that no backend reported, add them with a note
+7. **Rank**: CRITICAL → WARNING → INFO
+8. **Group by file**
+9. **Output final report** titled `## Code Council — Verified Review`
+   - Summary: total counts by severity, agreement matrix (which backends flagged each finding)
+   - For each finding: severity, location, detail, suggestion, and which backends reported it
 
 ### Step 5: Offer Follow-up Actions
 
@@ -174,12 +132,17 @@ After presenting, offer concrete next steps:
 ## Edge Cases
 
 **Single file, trivial size (<30 lines)**:
-- Still run the full council — small code can have critical issues
+- Still run the review — small code can have critical issues
 - Reviewers will naturally produce fewer findings
 
 **User provides a git diff instead of files**:
-- Capture the diff content, pass it inline in the `---CONTENT---` sections instead of `@` file references
-- Adjust reviewer prompts to focus on "changes" rather than "code"
+- Capture the diff content, pass it inline in `---CONTENT---` instead of `@` file references
+- Adjust the review prompt to focus on "changes" rather than "code"
+
+**Backend failure or timeout**:
+- If ≥1 backend returns results, proceed with available outputs. Note the failure in the final report.
+- If all backends fail, report the failure to the user and suggest retrying or switching backends.
+- Do NOT silently drop missing results — always disclose which backends succeeded and which did not.
 
 ## Critical Rules
 
@@ -187,6 +150,7 @@ After presenting, offer concrete next steps:
 2. **MUST use code-router skill** — this skill depends on code-router's `--parallel` execution
 3. **MUST be called by host agent only** — this skill is NOT designed for sub-agent use
 4. **NEVER modify source code in this skill** — code-council is read-only; fixes go through a separate action
+5. **NEVER ask backend selection questions** when the user's intent is clear — resolve from invocation or use defaults
 
 ## Example Invocations
 
@@ -198,11 +162,6 @@ Review @src/auth/login.ts and @src/auth/session.ts using code-council
 **Review recent changes (PR-style)**:
 ```
 Run code-council on the uncommitted changes
-```
-
-**Audit a module**:
-```
-code-council audit @src/payments/
 ```
 
 **Use specific backends**:
